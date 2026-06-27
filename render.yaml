@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: local-tiny-optimizer
+    name: image-optimizer-studio
     env: node
     plan: free
     buildCommand: npm ci && npm run build

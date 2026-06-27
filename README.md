@@ -1,6 +1,6 @@
-# Local Tiny Optimizer
+# Image Optimizer Studio
 
-A free local TinyPNG-style image optimizer. It runs a browser UI against a local Node API, so files stay on your machine unless you explicitly use URL import through the Tinify-compatible `/shrink` endpoint.
+A free local and self-hostable TinyPNG-style image optimizer. In local mode it runs a browser UI against a local Node API, so files stay on your machine unless you explicitly use URL import through the Tinify-compatible `/shrink` endpoint.
 
 ## Features
 
