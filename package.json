@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "concurrently -n api,web -c cyan,magenta \"tsx watch src/server/index.ts\" \"vite --host 127.0.0.1\"",
     "build": "tsc -p tsconfig.json && vite build",
-    "start": "node dist/server/index.js",
+    "start": "node dist/src/server/index.js",
     "test": "vitest run --config vitest.config.ts",
     "benchmark": "tsx scripts/benchmark.ts"
   },
