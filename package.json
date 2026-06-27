@@ -1,0 +1,43 @@
+{
+  "name": "local-tinypng",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -n api,web -c cyan,magenta \"tsx watch src/server/index.ts\" \"vite --host 127.0.0.1\"",
+    "build": "tsc -p tsconfig.json && vite build",
+    "start": "node dist/server/index.js",
+    "test": "vitest run --config vitest.config.ts",
+    "benchmark": "tsx scripts/benchmark.ts"
+  },
+  "dependencies": {
+    "@jsquash/jxl": "^1.3.0",
+    "@jsquash/oxipng": "^2.3.0",
+    "archiver": "^7.0.1",
+    "express": "^5.1.0",
+    "file-type": "^21.0.0",
+    "lucide-react": "^0.468.0",
+    "multer": "^2.0.2",
+    "nanoid": "^5.0.9",
+    "oxipng-bin": "^1.0.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "sharp": "^0.34.3"
+  },
+  "devDependencies": {
+    "@types/archiver": "^6.0.3",
+    "@types/express": "^5.0.3",
+    "@types/multer": "^2.0.0",
+    "@types/node": "^24.0.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@types/supertest": "^6.0.3",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.2",
+    "supertest": "^7.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11",
+    "vitest": "^2.1.5"
+  }
+}

@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.local-tinypng/
+dev-server.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+.env
+.env.*
+!.env.example
