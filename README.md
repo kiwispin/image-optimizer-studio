@@ -24,6 +24,14 @@ A free local and self-hostable TinyPNG-style image optimizer. In local mode it r
 
 ## Run
 
+For normal local use on Windows, double-click:
+
+```text
+Start Image Optimizer Studio.cmd
+```
+
+It opens the app at `http://127.0.0.1:4174`. If the local server is already running, it just opens the browser. If it is not running, it installs dependencies when needed, builds once when needed, and starts the local production server.
+
 ```powershell
 npm install
 npm run dev
