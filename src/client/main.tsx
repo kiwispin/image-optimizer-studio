@@ -489,8 +489,8 @@ function App() {
           <div className="brand-row">
             <div className="mark"><Wand2 size={22} /></div>
             <div>
-              <h1>Local Tiny Optimizer</h1>
-              <p>Private batch compression and conversion</p>
+              <h1>Image Optimizer Studio</h1>
+              <p>Batch compression, conversion, and previews</p>
             </div>
           </div>
 

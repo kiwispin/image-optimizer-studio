@@ -21,6 +21,10 @@ const upload = multer({
 const outputsRoot = path.resolve(process.cwd(), ".local-tinypng", "outputs");
 const resultByOutputId = new Map<string, { path: string; filename: string; type: string; source?: Buffer; sourceName?: string }>();
 const sourceByJobId = new Map<string, { buffer: Buffer; filename: string; type: string }>();
+const isHostedDeployment =
+  process.env.PUBLIC_DEPLOYMENT === "true" ||
+  process.env.RENDER === "true" ||
+  Boolean(process.env.RENDER_SERVICE_ID || process.env.RENDER_EXTERNAL_URL);
 
 function parseOptions(raw: unknown): Partial<ProcessOptions> {
   if (!raw) return {};
@@ -89,7 +93,7 @@ export async function createApp() {
   app.get("/api/health", async (_request, response) => {
     response.json({
       ok: true,
-      localOnly: true,
+      localOnly: !isHostedDeployment,
       codecs: ["auto", "png", "jpeg", "webp", "avif", "jxl", "heic-input-if-supported"],
       bundledEngines: [
         {

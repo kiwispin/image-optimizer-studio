@@ -5,5 +5,5 @@ const host = process.env.HOST || "0.0.0.0";
 const app = await createApp();
 
 app.listen(port, host, () => {
-  console.log(`Local Tiny Optimizer API listening on http://${host}:${port}`);
+  console.log(`Image Optimizer Studio API listening on http://${host}:${port}`);
 });
