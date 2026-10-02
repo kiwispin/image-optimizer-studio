@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -80,13 +80,14 @@ export async function optimizePngWithOxipng(buffer: Buffer): Promise<{ buffer: B
     } else {
       await execFileAsync(oxipng, ["-o", "4", "--strip", "safe", filePath], { timeout: 120000 });
     }
+    const optimized = await readFile(filePath);
+    return optimized.byteLength < buffer.byteLength
+      ? { buffer: optimized, optimizer: "oxipng" }
+      : { buffer };
   } catch {
     return { buffer };
+  } finally {
+    // Previously these temp files were never removed and piled up on disk.
+    await rm(filePath, { force: true }).catch(() => undefined);
   }
-
-  const optimized = await readFile(filePath);
-
-  return optimized.byteLength < buffer.byteLength
-    ? { buffer: optimized, optimizer: "oxipng" }
-    : { buffer };
 }

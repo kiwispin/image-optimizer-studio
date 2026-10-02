@@ -5,6 +5,28 @@ import { detectMime, extensionForMime, mimeForOutput, normalizeSharpFormat, sani
 import { saveOutput, storeOriginal, type StoredImage } from "./store.js";
 import { optimizePngWithOxipng } from "./external-tools.js";
 import { encodeJpegXl } from "./jxl.js";
+import { maxAvifPixels, maxInputPixels } from "./config.js";
+
+const pixelLimit: number | false = Number.isFinite(maxInputPixels) ? maxInputPixels : false;
+
+// Keep libvips' operation cache small so memory is released between jobs (matters on small hosts).
+sharp.cache({ memory: 48, files: 0, items: 64 });
+
+// Images larger than this are quality-searched on a downscaled proxy, then encoded at full size once.
+const PROXY_MIN_PIXELS = 1_000_000;
+const PROXY_MAX_EDGE = 1024;
+// Below this size AVIF's slow high-effort modes are cheap enough to keep.
+const SMALL_IMAGE_PIXELS = 300_000;
+
+/** "search" = proxy quality search, "small" = tiny image, "large" = full-size encode of a big image. */
+type EncodeTier = "search" | "small" | "large";
+
+function avifEffort(options: ProcessOptions, tier: EncodeTier): number {
+  if (tier === "search") return 3;
+  if (tier === "small") return options.preset === "ultra" ? 9 : 7;
+  // Effort 7+ is 4-5x slower than 5 on big photos for ~1-2% smaller files.
+  return options.preset === "ultra" ? 6 : 5;
+}
 
 const presetSettings = {
   balanced: { targetSsim: 0.982, jpeg: [84, 80, 76, 72], webp: [84, 80, 76, 72], avif: [58, 52, 46, 40], pngColors: [224, 192, 160, 128] },
@@ -57,8 +79,15 @@ interface ImageToneStats {
   saturation: number;
 }
 
+interface ReferenceImage {
+  metric: RawImage;
+  psnr: RawImage;
+  tone: ImageToneStats;
+}
+
 interface OptimizedResult {
   buffer: Buffer;
+  proxied: boolean;
   candidateCount: number;
   selectedQuality: number;
   psnr?: number;
@@ -82,7 +111,20 @@ function resizeKernel(kernel?: ResizeKernel): keyof sharp.KernelEnum {
 }
 
 function inputImage(buffer: Buffer, animated = false): sharp.Sharp {
-  return sharp(buffer, { animated, failOn: "none", limitInputPixels: false }).rotate();
+  return sharp(buffer, { animated, failOn: "none", limitInputPixels: pixelLimit }).rotate();
+}
+
+/** Approximate pixel count of the output after the user's resize settings. */
+function estimateOutputPixels(metadata: sharp.Metadata, options: ProcessOptions): number {
+  const width = metadata.width || 0;
+  const height = metadata.pageHeight || metadata.height || 0;
+  const resize = options.resize;
+  if (!resize || (!resize.width && !resize.height) || !width || !height) return width * height;
+  if ((resize.method === "cover" || resize.method === "thumb") && resize.width && resize.height) {
+    return Math.min(width * height, resize.width * resize.height);
+  }
+  const scale = Math.min(1, resize.width ? resize.width / width : Infinity, resize.height ? resize.height / height : Infinity);
+  return Math.round(width * scale) * Math.round(height * scale);
 }
 
 function displayDimensions(metadata: sharp.Metadata) {
@@ -181,7 +223,14 @@ function candidateQualities(format: EncodableFormat, options: ProcessOptions, co
   return [...settings[format]];
 }
 
-function encode(image: sharp.Sharp, format: EncodableFormat, options: ProcessOptions, quality: number, contentClass: ContentClass): sharp.Sharp {
+function encode(
+  image: sharp.Sharp,
+  format: EncodableFormat,
+  options: ProcessOptions,
+  quality: number,
+  contentClass: ContentClass,
+  tier: EncodeTier = "small"
+): sharp.Sharp {
   const keepMetadata = Boolean(options.preserve?.length);
   const colorManaged = image.keepIccProfile();
   const prepared = keepMetadata ? colorManaged.keepMetadata().withMetadata({ orientation: 1 }) : colorManaged;
@@ -211,7 +260,7 @@ function encode(image: sharp.Sharp, format: EncodableFormat, options: ProcessOpt
   if (format === "avif") {
     return prepared.avif({
       chromaSubsampling: contentClass === "graphic" || contentClass === "screenshot" ? "4:4:4" : "4:2:0",
-      effort: options.preset === "ultra" ? 9 : 7,
+      effort: avifEffort(options, tier),
       quality
     });
   }
@@ -258,21 +307,15 @@ async function rawForMetric(buffer: Buffer, width?: number, height?: number): Pr
   };
 }
 
-async function psnrApproximation(original: Buffer, optimized: Buffer): Promise<number | undefined> {
-  try {
-    const a = await rawForMetric(original, 96, 96);
-    const b = await rawForMetric(optimized, a.width, a.height);
-    let mse = 0;
-    for (let index = 0; index < a.data.length; index += 1) {
-      const diff = a.data[index] - b.data[index];
-      mse += diff * diff;
-    }
-    mse /= a.data.length;
-    if (mse === 0) return 99;
-    return Number((20 * Math.log10(255 / Math.sqrt(mse))).toFixed(2));
-  } catch {
-    return undefined;
+function psnrFromRaw(a: RawImage, b: RawImage): number {
+  let mse = 0;
+  for (let index = 0; index < a.data.length; index += 1) {
+    const diff = a.data[index] - b.data[index];
+    mse += diff * diff;
   }
+  mse /= a.data.length;
+  if (mse === 0) return 99;
+  return Number((20 * Math.log10(255 / Math.sqrt(mse))).toFixed(2));
 }
 
 function luminance(raw: RawImage, pixel: number): number {
@@ -331,26 +374,6 @@ function colorDeltaFromRaw(a: RawImage, b: RawImage): number {
   return Number((delta / (pixels * 3 * 255)).toFixed(5));
 }
 
-async function ssimApproximation(original: Buffer, optimized: Buffer): Promise<number | undefined> {
-  try {
-    const a = await rawForMetric(original, 160, 160);
-    const b = await rawForMetric(optimized, a.width, a.height);
-    return ssimFromRaw(a, b);
-  } catch {
-    return undefined;
-  }
-}
-
-async function colorDeltaApproximation(original: Buffer, optimized: Buffer): Promise<number | undefined> {
-  try {
-    const a = await rawForMetric(original, 160, 160);
-    const b = await rawForMetric(optimized, a.width, a.height);
-    return colorDeltaFromRaw(a, b);
-  } catch {
-    return undefined;
-  }
-}
-
 function toneStatsFromRaw(raw: RawImage): ImageToneStats {
   const pixels = raw.width * raw.height;
   if (!pixels) return { contrast: 0, saturation: 0 };
@@ -387,26 +410,99 @@ function toneStatsFromRaw(raw: RawImage): ImageToneStats {
   };
 }
 
-async function toneRatios(original: Buffer, optimized: Buffer): Promise<{ contrastRatio?: number; saturationRatio?: number }> {
+/**
+ * Decode the original once per job at the sizes the quality metrics use, instead of
+ * re-decoding the full-resolution original for every metric of every candidate.
+ */
+async function buildReference(original: Buffer): Promise<ReferenceImage | undefined> {
   try {
-    const a = await rawForMetric(original, 160, 160);
-    const b = await rawForMetric(optimized, a.width, a.height);
-    const originalStats = toneStatsFromRaw(a);
-    const optimizedStats = toneStatsFromRaw(b);
+    const metric = await rawForMetric(original, 160, 160);
+    const psnr = await rawForMetric(original, 96, 96);
+    return { metric, psnr, tone: toneStatsFromRaw(metric) };
+  } catch {
+    return undefined;
+  }
+}
+
+async function measureCandidate(reference: ReferenceImage | undefined, buffer: Buffer): Promise<Candidate["metrics"]> {
+  if (!reference) return {};
+  try {
+    const metric = await rawForMetric(buffer, reference.metric.width, reference.metric.height);
+    const psnr = await rawForMetric(buffer, reference.psnr.width, reference.psnr.height);
+    const tone = toneStatsFromRaw(metric);
     return {
-      contrastRatio: originalStats.contrast ? Number((optimizedStats.contrast / originalStats.contrast).toFixed(4)) : undefined,
-      saturationRatio: originalStats.saturation ? Number((optimizedStats.saturation / originalStats.saturation).toFixed(4)) : undefined
+      psnr: psnrFromRaw(reference.psnr, psnr),
+      ssim: ssimFromRaw(reference.metric, metric),
+      colorDelta: colorDeltaFromRaw(reference.metric, metric),
+      contrastRatio: reference.tone.contrast ? Number((tone.contrast / reference.tone.contrast).toFixed(4)) : undefined,
+      saturationRatio: reference.tone.saturation ? Number((tone.saturation / reference.tone.saturation).toFixed(4)) : undefined
     };
   } catch {
     return {};
   }
 }
 
-async function classifyContent(original: Buffer, metadata: sharp.Metadata): Promise<ContentClass> {
-  if ((metadata.pages || 1) > 1) return "animation";
+/**
+ * For large still images, build a small lossless proxy (resize + enhancements already applied)
+ * to run the quality search on. Encoding a 12 MP photo 4-8 times per format is what made the
+ * app take minutes and hundreds of MB per image; the metrics are measured at 160px anyway.
+ */
+async function buildSearchProxy(original: Buffer, options: ProcessOptions, metadata: sharp.Metadata): Promise<Buffer | undefined> {
+  if ((metadata.pages || 1) > 1) return undefined;
+  const pixels = (metadata.width || 0) * (metadata.height || 0);
+  if (pixels <= PROXY_MIN_PIXELS) return undefined;
 
   try {
-    const sample = await rawForMetric(original, 96, 96);
+    let prepared = inputImage(original);
+    prepared = applyResize(prepared, options);
+    prepared = applyEnhancements(prepared, options);
+    const stage = await prepared.keepIccProfile().png({ compressionLevel: 0, palette: false }).toBuffer({ resolveWithObject: true });
+    if (stage.info.width * stage.info.height <= PROXY_MIN_PIXELS) {
+      return stage.data;
+    }
+    return await sharp(stage.data, { failOn: "none", limitInputPixels: pixelLimit })
+      .resize({ width: PROXY_MAX_EDGE, height: PROXY_MAX_EDGE, fit: "inside", kernel: "lanczos3" })
+      .keepIccProfile()
+      .png({ compressionLevel: 0, palette: false })
+      .toBuffer();
+  } catch {
+    return undefined;
+  }
+}
+
+async function encodeFromOriginal(
+  original: Buffer,
+  format: EncodableFormat,
+  options: ProcessOptions,
+  quality: number,
+  contentClass: ContentClass,
+  tier: EncodeTier
+): Promise<Buffer> {
+  let image = inputImage(original, true);
+  image = applyResize(image, options);
+  image = applyEnhancements(image, options);
+  return format === "jxl"
+    ? encodeJpegXl(await image.png({ compressionLevel: 0, palette: false }).toBuffer(), quality)
+    : encode(image, format, options, quality, contentClass, tier).toBuffer();
+}
+
+async function encodeFromProxy(
+  proxy: Buffer,
+  format: EncodableFormat,
+  options: ProcessOptions,
+  quality: number,
+  contentClass: ContentClass
+): Promise<Buffer> {
+  return format === "jxl"
+    ? encodeJpegXl(proxy, quality)
+    : encode(sharp(proxy, { failOn: "none" }), format, options, quality, contentClass, "search").toBuffer();
+}
+
+async function classifyContent(sample: RawImage | undefined, metadata: sharp.Metadata): Promise<ContentClass> {
+  if ((metadata.pages || 1) > 1) return "animation";
+  if (!sample) return "photo";
+
+  try {
     const buckets = new Set<string>();
     let totalDelta = 0;
     let checks = 0;
@@ -457,36 +553,55 @@ function minToneRatioFor(contentClass: ContentClass, options: ProcessOptions): n
   return 0.975;
 }
 
-async function optimizeWithCandidateRace(
-  original: Buffer,
-  format: EncodableFormat,
-  options: ProcessOptions,
-  contentClass: ContentClass
-): Promise<OptimizedResult> {
+interface RaceContext {
+  original: Buffer;
+  reference?: ReferenceImage;
+  proxy?: Buffer;
+  options: ProcessOptions;
+  contentClass: ContentClass;
+  tier: EncodeTier;
+  allowAvif: boolean;
+  /** Per-job memo so "Auto" plus an explicit format (e.g. AVIF) doesn't run the same search twice. */
+  races?: Map<EncodableFormat, Promise<OptimizedResult>>;
+  finals?: Map<EncodableFormat, Promise<OptimizedResult>>;
+}
+
+function raceFormat(context: RaceContext, format: EncodableFormat): Promise<OptimizedResult> {
+  context.races ??= new Map();
+  let race = context.races.get(format);
+  if (!race) {
+    race = optimizeWithCandidateRace(context, format);
+    context.races.set(format, race);
+  }
+  return race;
+}
+
+function finalFormat(context: RaceContext, format: EncodableFormat, result: OptimizedResult): Promise<OptimizedResult> {
+  context.finals ??= new Map();
+  let final = context.finals.get(format);
+  if (!final) {
+    final = finalizeResult(context, format, result);
+    context.finals.set(format, final);
+  }
+  return final;
+}
+
+async function optimizeWithCandidateRace(context: RaceContext, format: EncodableFormat): Promise<OptimizedResult> {
+  const { original, reference, proxy, options, contentClass } = context;
   const targetSsim = targetSsimFor(options, contentClass);
   const maxColorDelta = maxColorDeltaFor(contentClass, options);
   const minToneRatio = minToneRatioFor(contentClass, options);
   const candidates: Candidate[] = [];
 
   for (const quality of candidateQualities(format, options, contentClass)) {
-    let image = inputImage(original, true);
-    image = applyResize(image, options);
-    image = applyEnhancements(image, options);
-    const buffer = format === "jxl"
-      ? await encodeJpegXl(await image.png({ compressionLevel: 0, palette: false }).toBuffer(), quality)
-      : await encode(image, format, options, quality, contentClass).toBuffer();
-    const tone = await toneRatios(original, buffer);
+    const buffer = proxy
+      ? await encodeFromProxy(proxy, format, options, quality, contentClass)
+      : await encodeFromOriginal(original, format, options, quality, contentClass, context.tier);
     candidates.push({
       buffer,
       quality,
       losslessFallback: format === "png" && quality === 0,
-      metrics: {
-        psnr: await psnrApproximation(original, buffer),
-        ssim: await ssimApproximation(original, buffer),
-        colorDelta: await colorDeltaApproximation(original, buffer),
-        contrastRatio: tone.contrastRatio,
-        saturationRatio: tone.saturationRatio
-      }
+      metrics: await measureCandidate(reference, buffer)
     });
   }
 
@@ -516,10 +631,9 @@ async function optimizeWithCandidateRace(
         return a.buffer.byteLength - b.buffer.byteLength;
       })[0];
 
-  const external = format === "png" ? await optimizePngWithOxipng(selected.buffer) : { buffer: selected.buffer };
-
   return {
-    buffer: external.buffer,
+    buffer: selected.buffer,
+    proxied: Boolean(proxy),
     candidateCount: candidates.length,
     selectedQuality: selected.quality,
     psnr: selected.metrics.psnr,
@@ -529,41 +643,54 @@ async function optimizeWithCandidateRace(
     saturationRatio: selected.metrics.saturationRatio,
     targetSsim,
     passedQualityGate: passing.includes(selected),
-    externalOptimizer: external.optimizer || selected.externalOptimizer,
+    externalOptimizer: selected.externalOptimizer,
     losslessFallback: selected.losslessFallback
   };
 }
 
-function autoCandidateFormats(originalFormat: OutputFormat, contentClass: ContentClass, hasAlpha?: boolean): EncodableFormat[] {
+/** Produce the real output for the chosen quality: full-size encode (if searched on a proxy) plus PNG post-optimization. */
+async function finalizeResult(context: RaceContext, format: EncodableFormat, result: OptimizedResult): Promise<OptimizedResult> {
+  const buffer = result.proxied
+    ? await encodeFromOriginal(context.original, format, context.options, result.selectedQuality, context.contentClass, context.tier)
+    : result.buffer;
+  const external = format === "png" ? await optimizePngWithOxipng(buffer) : { buffer };
+  return {
+    ...result,
+    buffer: external.buffer,
+    externalOptimizer: external.optimizer || result.externalOptimizer
+  };
+}
+
+function autoCandidateFormats(originalFormat: OutputFormat, contentClass: ContentClass, hasAlpha?: boolean, allowAvif = true): EncodableFormat[] {
   if (contentClass === "animation") {
     return originalFormat === "webp" || originalFormat === "png" ? [originalFormat] : ["webp"];
   }
 
-  if (hasAlpha) {
-    return ["webp", "avif", "png"];
-  }
+  const formats: EncodableFormat[] = (
+    hasAlpha || contentClass === "graphic" || contentClass === "screenshot" ? ["webp", "avif", "png"] : ["avif", "webp", "jpeg"]
+  ).filter((format) => allowAvif || format !== "avif") as EncodableFormat[];
 
-  if (contentClass === "graphic" || contentClass === "screenshot") {
-    return ["webp", "avif", "png"];
+  // Always let the input's own lossy format compete, so a JPEG that was misread as a graphic
+  // can still come back as a smaller JPEG instead of a much larger lossless PNG.
+  const lossyOriginal = originalFormat === "jpeg" || originalFormat === "webp" || (originalFormat === "avif" && allowAvif);
+  if (!hasAlpha && lossyOriginal && !formats.includes(originalFormat)) {
+    formats.push(originalFormat);
   }
-
-  return ["avif", "webp", "jpeg"];
+  return formats;
 }
 
 async function optimizeAuto(
-  original: Buffer,
+  context: RaceContext,
   originalFormat: OutputFormat,
-  options: ProcessOptions,
-  contentClass: ContentClass,
   hasAlpha?: boolean
 ): Promise<OptimizedResult & { format: EncodableFormat; candidateFormats: EncodableFormat[] }> {
-  const candidateFormats = autoCandidateFormats(originalFormat, contentClass, hasAlpha);
+  const candidateFormats = autoCandidateFormats(originalFormat, context.contentClass, hasAlpha, context.allowAvif);
   const results = [];
 
   for (const format of candidateFormats) {
     results.push({
       format,
-      ...(await optimizeWithCandidateRace(original, format, options, contentClass))
+      ...(await raceFormat(context, format))
     });
   }
 
@@ -574,8 +701,10 @@ async function optimizeAuto(
     return (b.ssim || 0) - (a.ssim || 0);
   })[0];
 
+  // Only the winning format is encoded at full size.
   return {
-    ...selected,
+    ...(await finalFormat(context, selected.format, selected)),
+    format: selected.format,
     candidateFormats
   };
 }
@@ -587,16 +716,35 @@ export async function processStoredImage(stored: StoredImage, original: Buffer, 
   try {
     const metadata = await sharp(original, { animated: true, failOn: "none", limitInputPixels: false }).metadata();
     const inputDimensions = displayDimensions(metadata);
-    const contentClass = await classifyContent(original, metadata);
+    const inputPixels = (metadata.width || 0) * (metadata.height || 0);
+    if (pixelLimit && inputPixels > pixelLimit) {
+      throw new Error(
+        `This image is ${(inputPixels / 1e6).toFixed(1)} MP; this server accepts up to ${Math.round(pixelLimit / 1e6)} MP. Run the app locally for larger images.`
+      );
+    }
+    const outputPixels = estimateOutputPixels(metadata, options);
+    const allowAvif = outputPixels <= maxAvifPixels;
+    const notes: string[] = [];
+    const reference = await buildReference(original);
+    const contentClass = await classifyContent(reference?.psnr, metadata);
     const originalFormat = normalizeSharpFormat(metadata.format);
     const requestedFormats = options.formats.map((format) => (format === "original" ? originalFormat : format));
     const uniqueFormats = [...new Set(requestedFormats)];
     const variants: OutputVariant[] = [];
+    const context: RaceContext = {
+      original,
+      reference,
+      proxy: await buildSearchProxy(original, options, metadata),
+      options,
+      contentClass,
+      tier: outputPixels <= SMALL_IMAGE_PIXELS ? "small" : "large",
+      allowAvif
+    };
 
     for (const format of uniqueFormats) {
       if (format === "auto") {
         const variantId = nanoid(12);
-        const optimized = await optimizeAuto(original, originalFormat, options, contentClass, metadata.hasAlpha);
+        const optimized = await optimizeAuto(context, originalFormat, metadata.hasAlpha);
         const outputBuffer = optimized.buffer;
         const outputMeta = optimized.format === "jxl" ? metadata : await sharp(outputBuffer, { animated: true, failOn: "none" }).metadata();
         const mime = mimeForOutput(optimized.format);
@@ -635,13 +783,19 @@ export async function processStoredImage(stored: StoredImage, original: Buffer, 
         continue;
       }
 
-      if (format === "jxl") {
-      } else if (format === "original") {
+      if (format === "original") {
         throw new Error("Original output format could not be resolved from the input image.");
       }
 
+      if (format === "avif" && !allowAvif) {
+        notes.push(
+          `AVIF was skipped: at ${(outputPixels / 1e6).toFixed(1)} MP it needs more memory than this server allows (limit ${Math.round(maxAvifPixels / 1e6)} MP). Resize first, pick WebP, or run the app locally.`
+        );
+        continue;
+      }
+
       const variantId = nanoid(12);
-      const optimized = await optimizeWithCandidateRace(original, format, options, contentClass);
+      const optimized = await finalFormat(context, format, await raceFormat(context, format));
       const outputBuffer = optimized.buffer;
       const outputMeta = format === "jxl" ? metadata : await sharp(outputBuffer, { animated: true, failOn: "none" }).metadata();
       const mime = mimeForOutput(format);
@@ -687,7 +841,9 @@ export async function processStoredImage(stored: StoredImage, original: Buffer, 
         height: inputDimensions.height,
         previewUrl: `/input/${stored.id}`
       },
-      status: "done",
+      status: variants.length ? "done" : "error",
+      error: variants.length ? undefined : notes[0],
+      notes: notes.length ? notes : undefined,
       variants
     };
   } catch (error) {
@@ -706,8 +862,13 @@ export async function processStoredImage(stored: StoredImage, original: Buffer, 
   }
 }
 
-export async function processUpload(buffer: Buffer, originalFilename: string, options?: Partial<ProcessOptions>): Promise<JobResult> {
+export async function processUpload(
+  buffer: Buffer,
+  originalFilename: string,
+  options?: Partial<ProcessOptions>,
+  existingPath?: string
+): Promise<JobResult> {
   const mime = await detectMime(buffer, originalFilename);
-  const stored = await storeOriginal(buffer, originalFilename, mime);
+  const stored = await storeOriginal(buffer, originalFilename, mime, existingPath);
   return processStoredImage(stored, buffer, options);
 }

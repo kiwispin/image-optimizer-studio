@@ -1,17 +1,17 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
-import { Download, FileArchive, Hand, ImagePlus, MoveHorizontal, RefreshCw, RotateCcw, Settings2, Wand2 } from "lucide-react";
+import { Download, FileArchive, Hand, ImagePlus, Info, MoveHorizontal, RefreshCw, RotateCcw, Settings2, Wand2, X } from "lucide-react";
 import type { BatchResponse, JobResult, OutputFormat, Preset, ProcessOptions, ResizeKernel, ResizeMethod } from "../shared/types";
 import "./styles.css";
 
-const outputFormats: Array<{ value: OutputFormat; label: string }> = [
-  { value: "auto", label: "Auto" },
-  { value: "original", label: "Original" },
-  { value: "avif", label: "AVIF" },
-  { value: "webp", label: "WebP" },
-  { value: "jpeg", label: "JPEG" },
-  { value: "png", label: "PNG" },
-  { value: "jxl", label: "JXL" }
+const outputFormats: Array<{ value: OutputFormat; label: string; title: string }> = [
+  { value: "auto", label: "Auto", title: "Try the modern formats and keep the smallest that passes the quality checks" },
+  { value: "original", label: "Original", title: "Keep the same format as the uploaded file" },
+  { value: "avif", label: "AVIF", title: "Smallest files, slowest to encode" },
+  { value: "webp", label: "WebP", title: "Small files, supported by every modern browser" },
+  { value: "jpeg", label: "JPEG", title: "Works everywhere; no transparency" },
+  { value: "png", label: "PNG", title: "Lossless or palette PNG; best for graphics and transparency" },
+  { value: "jxl", label: "JXL", title: "JPEG XL; limited browser support" }
 ];
 
 const presetOptions: Array<{ value: Preset; label: string; title: string }> = [
@@ -44,6 +44,46 @@ function formatSavings(savings: number): string {
 function formatSigned(value: string): string {
   const number = Number(value);
   return number > 0 ? `+${number}` : String(number);
+}
+
+function zipUrlFor(jobs: JobResult[]): string | undefined {
+  const ids = jobs.flatMap((job) => job.variants.map((variant) => variant.id));
+  return ids.length ? `/api/download.zip?ids=${ids.map(encodeURIComponent).join(",")}` : undefined;
+}
+
+function formatSimilarity(ssim?: number): string {
+  if (!ssim) return "-";
+  return `${(ssim * 100).toFixed(ssim >= 0.9995 ? 2 : 1)}% match`;
+}
+
+function errorJob(file: File, message: string): JobResult {
+  return {
+    id: `error-${pendingId()}`,
+    originalFilename: file.name,
+    input: { size: file.size, type: file.type || "unknown" },
+    status: "error",
+    error: message,
+    variants: []
+  };
+}
+
+async function readError(response: Response, fallback: string): Promise<string> {
+  try {
+    const payload = await response.json();
+    if (payload?.error) return String(payload.error);
+  } catch {
+    // Non-JSON error (e.g. a proxy or host limit page).
+  }
+  if (response.status === 413) return "This image is too large for this server.";
+  if (response.status === 502 || response.status === 503) return "The server ran out of resources or restarted while processing. Try fewer or smaller images, or run the app locally.";
+  return `${fallback} (HTTP ${response.status})`;
+}
+
+interface ServerInfo {
+  localOnly: boolean;
+  maxUploadMb?: number;
+  retentionHours?: number;
+  engines: string[];
 }
 
 function bestVariant(job: JobResult) {
@@ -238,12 +278,14 @@ function App() {
   const [background, setBackground] = React.useState("#ffffff");
   const [preserveMetadata, setPreserveMetadata] = React.useState(false);
   const [isDragging, setIsDragging] = React.useState(false);
+  const [adjustmentsOpen] = React.useState(() => typeof window === "undefined" || window.matchMedia("(min-width: 901px)").matches);
   const [isProcessing, setIsProcessing] = React.useState(false);
   const [isReprocessing, setIsReprocessing] = React.useState(false);
   const [pendingImages, setPendingImages] = React.useState<PendingImage[]>([]);
   const [jobs, setJobs] = React.useState<JobResult[]>([]);
-  const [zipUrl, setZipUrl] = React.useState<string>();
-  const [engineStatus, setEngineStatus] = React.useState<{ active: number; label: string }>({ active: 0, label: "Built-in race" });
+  const [progress, setProgress] = React.useState<{ done: number; total: number; current?: string } | null>(null);
+  const [serverInfo, setServerInfo] = React.useState<ServerInfo>({ localOnly: true, engines: [] });
+  const zipUrl = React.useMemo(() => zipUrlFor(jobs), [jobs]);
 
   React.useEffect(() => {
     fetch("/api/health")
@@ -251,15 +293,17 @@ function App() {
       .then((payload) => {
         const tools = Array.isArray(payload.specialistTools) ? payload.specialistTools : [];
         const bundled = Array.isArray(payload.bundledEngines) ? payload.bundledEngines : [];
-        const activeTools = tools.filter((tool: { available?: boolean }) => tool.available).length;
-        const activeBundled = bundled.filter((tool: { available?: boolean }) => tool.available).length;
-        const active = activeTools + activeBundled;
-        setEngineStatus({
-          active,
-          label: active ? `${active} active add-ons` : "Built-in race"
+        const engines = [...bundled, ...tools]
+          .filter((tool: { available?: boolean }) => tool.available)
+          .map((tool: { name: string }) => tool.name);
+        setServerInfo({
+          localOnly: payload.localOnly !== false,
+          maxUploadMb: payload.limits?.maxUploadMb,
+          retentionHours: payload.limits?.retentionHours,
+          engines
         });
       })
-      .catch(() => setEngineStatus({ active: 0, label: "Built-in race" }));
+      .catch(() => undefined);
   }, []);
 
   const aspectSource = React.useMemo(() => {
@@ -315,7 +359,9 @@ function App() {
   const liveTone = React.useMemo(() => toneFilter(options, processedOptions), [options, processedOptions]);
   const hasStaleResults = jobs.length > 0 && (processedOptionsKey !== optionsKey || liveTone.active);
   const liveToneFilter = jobs.length > 0 && liveTone.active ? liveTone.filter : undefined;
-  const updateLabel = liveTone.active ? "Apply Preview" : "Update";
+  const updateLabel = liveTone.active ? "Apply preview" : "Apply new settings";
+  const adjustmentsChanged =
+    denoise !== "0" || sharpen !== "0" || brightness !== "0" || contrast !== "0" || background.toLowerCase() !== "#ffffff" || preserveMetadata;
 
   function addPendingImages(files: FileList | File[]) {
     const selected = Array.from(files).filter((file) => file.type.startsWith("image/") || /\.(jxl|heic|heif|apng)$/i.test(file.name));
@@ -344,23 +390,50 @@ function App() {
   }
 
   async function optimizePendingImages() {
-    if (!pendingImages.length) return;
-    const formData = new FormData();
-    pendingImages.forEach((item) => formData.append("images", item.file));
-    formData.append("options", JSON.stringify(options));
+    if (!pendingImages.length || isProcessing || isReprocessing) return;
+    // Oldest first, one request per image: results appear as they finish, a single bad file
+    // can't sink the whole batch, and the server never holds the whole batch in memory.
+    const queue = [...pendingImages].reverse();
+    const requestOptions = JSON.stringify(options);
     setIsProcessing(true);
+    setProcessedOptionsKey(optionsKey);
 
     try {
-      const response = await fetch("/api/jobs", { method: "POST", body: formData });
-      const payload = (await response.json()) as BatchResponse;
-      setJobs((current) => [...payload.jobs, ...current]);
-      setZipUrl(payload.zipUrl);
-      setProcessedOptionsKey(optionsKey);
-      clearPendingImages();
+      for (const [index, item] of queue.entries()) {
+        setProgress({ done: index, total: queue.length, current: item.file.name });
+        const formData = new FormData();
+        formData.append("options", requestOptions);
+        formData.append("images", item.file);
+        let result: JobResult[];
+        try {
+          const response = await fetch("/api/jobs", { method: "POST", body: formData });
+          result = response.ok
+            ? ((await response.json()) as BatchResponse).jobs
+            : [errorJob(item.file, await readError(response, "Could not optimize this image"))];
+        } catch {
+          result = [errorJob(item.file, "Lost connection to the optimizer. Check the server is still running.")];
+        }
+        setJobs((current) => [...result, ...current]);
+        URL.revokeObjectURL(item.previewUrl);
+        setPendingImages((current) => current.filter((candidate) => candidate.id !== item.id));
+      }
     } finally {
+      setProgress(null);
       setIsProcessing(false);
       setIsDragging(false);
     }
+  }
+
+  function removePending(id: string) {
+    setPendingImages((current) => {
+      const item = current.find((candidate) => candidate.id === id);
+      if (item) URL.revokeObjectURL(item.previewUrl);
+      return current.filter((candidate) => candidate.id !== id);
+    });
+  }
+
+  function removeJob(id: string) {
+    setJobs((current) => current.filter((job) => job.id !== id));
   }
 
   const reprocessResults = React.useCallback(async (): Promise<JobResult[]> => {
@@ -368,19 +441,34 @@ function App() {
     setIsReprocessing(true);
     try {
       const updated: JobResult[] = [];
-      for (const job of jobs) {
-        const response = await fetch(`/api/jobs/${job.id}/reprocess`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ options })
-        });
-        updated.push((await response.json()) as JobResult);
+      for (const [index, job] of jobs.entries()) {
+        setProgress({ done: index, total: jobs.length, current: job.originalFilename });
+        if (job.id.startsWith("error-")) {
+          updated.push(job);
+          continue;
+        }
+        try {
+          const response = await fetch(`/api/jobs/${job.id}/reprocess`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ options })
+          });
+          updated.push(
+            response.ok
+              ? ((await response.json()) as JobResult)
+              : { ...job, status: "error", variants: [], error: await readError(response, "Could not update this image") }
+          );
+        } catch {
+          updated.push({ ...job, status: "error", variants: [], error: "Lost connection to the optimizer." });
+        }
       }
-      setJobs(updated);
-      setZipUrl(updated.some((job) => job.variants.length) ? "/api/download.zip" : undefined);
+      // Merge by id so anything added meanwhile isn't overwritten by this snapshot.
+      const replacements = new Map(jobs.map((job, index) => [job.id, updated[index]]));
+      setJobs((current) => current.map((job) => replacements.get(job.id) ?? job));
       setProcessedOptionsKey(optionsKey);
       return updated;
     } finally {
+      setProgress(null);
       setIsReprocessing(false);
     }
   }, [jobs, options, optionsKey]);
@@ -395,16 +483,24 @@ function App() {
     window.location.assign(url);
   }
 
+  const isBusy = isProcessing || isReprocessing;
+
   async function downloadAll(event: React.MouseEvent<HTMLAnchorElement>) {
+    if (isBusy) {
+      event.preventDefault();
+      return;
+    }
     if (!hasStaleResults) return;
     event.preventDefault();
     const updated = await currentJobsForDownload();
-    if (updated.some((job) => job.variants.length)) {
-      startDownload("/api/download.zip");
-    }
+    startDownload(zipUrlFor(updated));
   }
 
   async function downloadVariant(event: React.MouseEvent<HTMLAnchorElement>, jobIndex: number, variantId: string, fallbackUrl: string) {
+    if (isBusy && hasStaleResults) {
+      event.preventDefault();
+      return;
+    }
     if (!hasStaleResults) return;
     event.preventDefault();
     const updated = await currentJobsForDownload();
@@ -465,16 +561,16 @@ function App() {
   function clearAll() {
     clearPendingImages();
     setJobs([]);
-    setZipUrl(undefined);
     setProcessedOptionsKey(optionsKey);
   }
 
   const totals = jobs.reduce(
     (acc, job) => {
       const variant = bestVariant(job);
+      if (job.status !== "done" || !variant) return acc;
       acc.input += job.input.size;
-      acc.output += variant?.size || 0;
-      acc.done += job.status === "done" ? 1 : 0;
+      acc.output += variant.size;
+      acc.done += 1;
       return acc;
     },
     { input: 0, output: 0, done: 0 }
@@ -487,38 +583,53 @@ function App() {
       <section className="workspace">
         <aside className="controls" aria-label="Optimization settings">
           <div className="brand-row">
-            <div className="mark"><Wand2 size={22} /></div>
+            <div className="mark" aria-hidden="true"><Wand2 size={22} /></div>
             <div>
               <h1>Image Optimizer Studio</h1>
               <p>Batch compression, conversion, and previews</p>
             </div>
           </div>
 
-          <div className="control-group">
-            <label>Preset</label>
+          <div className="control-group" role="group" aria-labelledby="preset-label">
+            <span className="group-label" id="preset-label">Preset</span>
             <div className="segmented">
               {presetOptions.map((item) => (
-                <button className={preset === item.value ? "active" : ""} key={item.value} onClick={() => setPreset(item.value)} title={item.title} type="button">
+                <button
+                  aria-pressed={preset === item.value}
+                  className={preset === item.value ? "active" : ""}
+                  key={item.value}
+                  onClick={() => setPreset(item.value)}
+                  title={item.title}
+                  type="button"
+                >
                   {item.label}
                 </button>
               ))}
             </div>
+            <p className="hint">{presetOptions.find((item) => item.value === preset)?.title}</p>
           </div>
 
-          <div className="control-group">
-            <label>Output</label>
+          <div className="control-group" role="group" aria-labelledby="output-label">
+            <span className="group-label" id="output-label">Output formats</span>
             <div className="format-grid">
               {outputFormats.map((format) => (
-                <button className={formats.includes(format.value) ? "active" : ""} key={format.value} onClick={() => toggleFormat(format.value)} type="button">
+                <button
+                  aria-pressed={formats.includes(format.value)}
+                  className={formats.includes(format.value) ? "active" : ""}
+                  key={format.value}
+                  onClick={() => toggleFormat(format.value)}
+                  title={format.title}
+                  type="button"
+                >
                   {format.label}
                 </button>
               ))}
             </div>
           </div>
 
-          <div className="engine-status">
-            <span>Engine</span>
-            <strong>{engineStatus.label}</strong>
+          <div className="engine-status" title={serverInfo.engines.length ? `Extra engines: ${serverInfo.engines.join(", ")}` : "Using the built-in Sharp/libvips encoders"}>
+            <span>Engines</span>
+            <strong>{serverInfo.engines.length ? `Built-in + ${serverInfo.engines.length} extra` : "Built-in"}</strong>
           </div>
 
           <div className="control-group">
@@ -527,69 +638,91 @@ function App() {
               <input id="resize" checked={resizeEnabled} onChange={(event) => setResizeEnabled(event.target.checked)} type="checkbox" />
             </div>
             <div className="resize-grid">
-              <select disabled={!resizeEnabled} onChange={(event) => setResizeMethod(event.target.value as ResizeMethod)} value={resizeMethod}>
+              <select aria-label="Resize method" disabled={!resizeEnabled} onChange={(event) => setResizeMethod(event.target.value as ResizeMethod)} value={resizeMethod}>
                 <option value="fit">Fit</option>
                 <option value="cover">Cover</option>
                 <option value="thumb">Smart thumb</option>
                 <option value="scale">Scale</option>
               </select>
-              <select disabled={!resizeEnabled} onChange={(event) => setResizeKernel(event.target.value as ResizeKernel)} value={resizeKernel}>
+              <select aria-label="Resize quality" disabled={!resizeEnabled} onChange={(event) => setResizeKernel(event.target.value as ResizeKernel)} value={resizeKernel}>
                 {resizeQualityOptions.map((item) => (
                   <option key={item.value} value={item.value}>
                     {item.label}
                   </option>
                 ))}
               </select>
-              <input disabled={!resizeEnabled} min="1" onChange={(event) => updateResizeWidth(event.target.value)} placeholder="Width" type="number" value={width} />
-              <input disabled={!resizeEnabled} min="1" onChange={(event) => updateResizeHeight(event.target.value)} placeholder="Height" type="number" value={height} />
+              <input disabled={!resizeEnabled} min="1" onChange={(event) => updateResizeWidth(event.target.value)} placeholder="Width" aria-label="Width in pixels" type="number" value={width} />
+              <input disabled={!resizeEnabled} min="1" onChange={(event) => updateResizeHeight(event.target.value)} placeholder="Height" aria-label="Height in pixels" type="number" value={height} />
             </div>
           </div>
 
+          <details className="adjustments" open={adjustmentsOpen}>
+            <summary>
+              <span>Adjustments</span>
+              {adjustmentsChanged && <span className="badge">Modified</span>}
+            </summary>
+            <div className="adjustments-body">
           <div className="control-group">
-            <label>Noise</label>
+            <label htmlFor="denoise">Noise reduction</label>
             <div className="range-row">
-              <input max="10" min="0" onChange={(event) => setDenoise(event.target.value)} type="range" value={denoise} />
-              <output>{denoise}</output>
+              <input id="denoise" max="10" min="0" onChange={(event) => setDenoise(event.target.value)} onDoubleClick={() => setDenoise("0")} title="Double-click to reset" type="range" value={denoise} />
+              <output htmlFor="denoise">{denoise}</output>
             </div>
           </div>
 
           <div className="control-group">
-            <label>Brightness</label>
+            <label htmlFor="brightness">Brightness</label>
             <div className="range-row">
-              <input max="50" min="-50" onChange={(event) => setBrightness(event.target.value)} type="range" value={brightness} />
-              <output>{formatSigned(brightness)}</output>
+              <input id="brightness" max="50" min="-50" onChange={(event) => setBrightness(event.target.value)} onDoubleClick={() => setBrightness("0")} title="Double-click to reset" type="range" value={brightness} />
+              <output htmlFor="brightness">{formatSigned(brightness)}</output>
             </div>
           </div>
 
           <div className="control-group">
-            <label>Contrast</label>
+            <label htmlFor="contrast">Contrast</label>
             <div className="range-row">
-              <input max="50" min="-50" onChange={(event) => setContrast(event.target.value)} type="range" value={contrast} />
-              <output>{formatSigned(contrast)}</output>
+              <input id="contrast" max="50" min="-50" onChange={(event) => setContrast(event.target.value)} onDoubleClick={() => setContrast("0")} title="Double-click to reset" type="range" value={contrast} />
+              <output htmlFor="contrast">{formatSigned(contrast)}</output>
             </div>
           </div>
 
           <div className="control-group">
-            <label>Sharpen</label>
+            <label htmlFor="sharpen">Sharpen</label>
             <div className="range-row">
-              <input max="10" min="0" onChange={(event) => setSharpen(event.target.value)} type="range" value={sharpen} />
-              <output>{sharpen}</output>
+              <input id="sharpen" max="10" min="0" onChange={(event) => setSharpen(event.target.value)} onDoubleClick={() => setSharpen("0")} title="Double-click to reset" type="range" value={sharpen} />
+              <output htmlFor="sharpen">{sharpen}</output>
             </div>
           </div>
 
           <div className="control-group">
-            <label>Transparency Fill</label>
-            <input aria-label="Background color" className="color-field" onChange={(event) => setBackground(event.target.value)} type="color" value={background} />
+            <label htmlFor="background">Transparency fill</label>
+            <div className="color-row">
+              <input id="background" className="color-field" onChange={(event) => setBackground(event.target.value)} type="color" value={background} />
+              <span>{background.toUpperCase()}</span>
+              <small>Used when converting transparent images to JPEG</small>
+            </div>
           </div>
 
           <div className="control-group compact-row">
-            <Settings2 size={18} />
+            <Settings2 aria-hidden="true" size={18} />
             <label htmlFor="metadata">Preserve metadata</label>
             <input id="metadata" checked={preserveMetadata} onChange={(event) => setPreserveMetadata(event.target.checked)} type="checkbox" />
           </div>
+            </div>
+          </details>
         </aside>
 
         <section className="main-panel">
+          {!serverInfo.localOnly && (
+            <div className="host-notice" role="note">
+              <Info aria-hidden="true" size={17} />
+              <span>
+                Hosted version: images up to {serverInfo.maxUploadMb ?? "?"} MB, processed one at a time, and deleted after{" "}
+                {serverInfo.retentionHours && serverInfo.retentionHours < 1 ? `${Math.round(serverInfo.retentionHours * 60)} minutes` : `${serverInfo.retentionHours ?? 1} hour${serverInfo.retentionHours === 1 ? "" : "s"}`}
+                . For big batches or large photos, run the app locally.
+              </span>
+            </div>
+          )}
           <div
             className={`dropzone ${isDragging ? "dragging" : ""}`}
             onDragLeave={() => setIsDragging(false)}
@@ -613,34 +746,54 @@ function App() {
               accept="image/*,.jxl,.heic,.heif,.apng"
             />
             <label htmlFor="file-picker">
-              <ImagePlus size={34} />
-              <span>{pendingImages.length ? `${pendingImages.length} queued - adjust settings, then Optimize` : "Drop images here or choose files"}</span>
+              <ImagePlus aria-hidden="true" size={30} />
+              <span className="dropzone-title">{isDragging ? "Drop to add" : "Drop images here or choose files"}</span>
+              <span className="dropzone-hint">JPEG, PNG, WebP, AVIF, GIF, HEIC and JPEG XL. Files are queued so you can adjust settings first.</span>
             </label>
           </div>
 
-          {pendingImages.length > 0 && (
+          {(pendingImages.length > 0 || (progress && isProcessing)) && (
             <div className="queue-strip" aria-label="Queued images">
               <div>
-                <strong>{pendingImages.length} queued</strong>
-                <span>{formatBytes(pendingBytes)} ready</span>
+                <strong>{progress && isProcessing ? `Optimizing ${progress.done + 1} of ${progress.total}` : `${pendingImages.length} queued`}</strong>
+                <span>{progress && isProcessing ? progress.current : `${formatBytes(pendingBytes)} ready`}</span>
               </div>
               <div className="queue-files">
                 {pendingImages.slice(0, 4).map((item) => (
-                  <span key={item.id}>{item.file.name}</span>
+                  <span className="queue-chip" key={item.id}>
+                    <span>{item.file.name}</span>
+                    {!isProcessing && (
+                      <button aria-label={`Remove ${item.file.name} from the queue`} onClick={() => removePending(item.id)} type="button">
+                        <X aria-hidden="true" size={13} />
+                      </button>
+                    )}
+                  </span>
                 ))}
-                {pendingImages.length > 4 && <span>+{pendingImages.length - 4} more</span>}
+                {pendingImages.length > 4 && <span className="queue-chip">+{pendingImages.length - 4} more</span>}
               </div>
-              <button className="action-button attention" disabled={isProcessing} onClick={optimizePendingImages} type="button">
-                <Wand2 size={17} />
-                {isProcessing ? "Optimizing" : "Optimize"}
+              <button className="action-button attention" disabled={isBusy || !pendingImages.length} onClick={optimizePendingImages} type="button">
+                <Wand2 aria-hidden="true" size={17} />
+                {isProcessing ? "Optimizing..." : `Optimize ${pendingImages.length > 1 ? `${pendingImages.length} images` : ""}`.trim()}
               </button>
+              {progress && isProcessing && (
+                <div
+                  aria-label="Optimization progress"
+                  aria-valuemax={progress.total}
+                  aria-valuemin={0}
+                  aria-valuenow={progress.done}
+                  className="progress-track"
+                  role="progressbar"
+                >
+                  <div style={{ width: `${Math.max(4, (progress.done / progress.total) * 100)}%` }} />
+                </div>
+              )}
             </div>
           )}
 
           <div className="stats-band">
             <div>
-              <strong>{pendingImages.length || jobs.length}</strong>
-              <span>{pendingImages.length ? "queued" : "processed"}</span>
+              <strong>{totals.done}</strong>
+              <span>optimized</span>
             </div>
             <div>
               <strong>{formatBytes(totals.input)}</strong>
@@ -648,27 +801,36 @@ function App() {
             </div>
             <div>
               <strong>{formatBytes(totals.output)}</strong>
-              <span>optimized</span>
+              <span>now</span>
             </div>
             <div>
               <strong>{Math.abs(Math.round(totalSavings * 100))}%</strong>
               <span>{totalSavings >= 0 ? "saved" : "larger"}</span>
             </div>
-            <div className="stat-actions">
-              {jobs.length > 0 && (
-                <button className={`action-button ${hasStaleResults ? "attention" : ""}`} disabled={isReprocessing || !hasStaleResults} onClick={reprocessResults} type="button">
-                  <RefreshCw size={17} />
-                  {isReprocessing ? "Updating" : updateLabel}
+            <div className={`stat-actions ${jobs.length || pendingImages.length ? "" : "is-empty"}`}>
+              {jobs.length > 0 && hasStaleResults && (
+                <button className="action-button attention" disabled={isReprocessing || isProcessing} onClick={reprocessResults} title="Re-run the results with the current settings" type="button">
+                  <RefreshCw aria-hidden="true" size={17} />
+                  {isReprocessing && progress ? `Updating ${progress.done + 1}/${progress.total}` : updateLabel}
                 </button>
               )}
               {zipUrl && (
-                <a className="icon-button" href={zipUrl} onClick={downloadAll} title={hasStaleResults ? "Apply current settings and download all" : "Download all"}>
-                  <FileArchive size={19} />
+                <a
+                  aria-disabled={isBusy}
+                  className={`action-button ${isBusy ? "is-disabled" : ""}`}
+                  href={zipUrl}
+                  onClick={downloadAll}
+                  title={isBusy ? "Wait for processing to finish" : hasStaleResults ? "Apply current settings and download all as a ZIP" : "Download all as a ZIP"}
+                >
+                  <FileArchive aria-hidden="true" size={17} />
+                  Download all
                 </a>
               )}
-              <button className="icon-button" onClick={clearAll} title="Clear results" type="button">
-                <RotateCcw size={19} />
-              </button>
+              {(jobs.length > 0 || pendingImages.length > 0) && (
+                <button aria-label="Clear queue and results" className="icon-button" disabled={isProcessing || isReprocessing} onClick={clearAll} title="Clear queue and results" type="button">
+                  <RotateCcw aria-hidden="true" size={19} />
+                </button>
+              )}
             </div>
           </div>
 
@@ -679,17 +841,27 @@ function App() {
               jobs.map((job, jobIndex) => {
                 const variant = bestVariant(job);
                 return (
-                  <article className="result-card" key={job.id}>
-                    <ComparePreview job={job} liveToneFilter={liveToneFilter} stale={hasStaleResults || isReprocessing} variant={variant} />
+                  <article className={`result-card ${job.status === "error" ? "is-error" : ""}`} key={job.id}>
+                    {job.status !== "error" && <ComparePreview job={job} liveToneFilter={liveToneFilter} stale={hasStaleResults || isReprocessing} variant={variant} />}
                     <div className="file-meta">
-                      <strong>{job.originalFilename}</strong>
-                      <span>{job.input.width && job.input.height ? `${job.input.width} x ${job.input.height}` : job.input.type}</span>
+                      <strong title={job.originalFilename}>{job.originalFilename}</strong>
+                      <span>
+                        {job.input.width && job.input.height ? `${job.input.width} × ${job.input.height}` : job.input.type} · {formatBytes(job.input.size)}
+                      </span>
                     </div>
+                    <button aria-label={`Remove ${job.originalFilename} from results`} className="remove-result" disabled={isReprocessing} onClick={() => removeJob(job.id)} title="Remove from results" type="button">
+                      <X aria-hidden="true" size={16} />
+                    </button>
                     {job.status === "error" ? (
                       <p className="error-text">{job.error}</p>
                     ) : (
                       <>
                         <div className={`savings-pill ${variant && variant.savings < 0 ? "larger" : ""}`}>{variant ? formatSavings(variant.savings) : "optimized"}</div>
+                        {job.notes?.map((note) => (
+                          <p className="note-text" key={note}>
+                            {note}
+                          </p>
+                        ))}
                         <div className="variant-list">
                           {job.variants.map((item) => (
                             <a
@@ -697,12 +869,12 @@ function App() {
                               href={item.downloadUrl}
                               key={item.id}
                               onClick={(event) => downloadVariant(event, jobIndex, item.id, item.downloadUrl)}
-                              title={hasStaleResults ? "Apply current settings and download" : "Download"}
+                              title={hasStaleResults ? "Apply current settings and download" : `Download ${item.filename}`}
                             >
-                              <span>{item.metrics?.autoSelected ? `AUTO ${item.format.toUpperCase()}` : item.format.toUpperCase()}</span>
+                              <span className="variant-format">{item.metrics?.autoSelected ? `Auto · ${item.format.toUpperCase()}` : item.format.toUpperCase()}</span>
                               <span>{formatBytes(item.size)}</span>
-                              <span>{item.metrics?.ssim ? `SSIM ${item.metrics.ssim}` : "metric pending"}</span>
-                              <Download size={17} />
+                              <span title={item.metrics?.ssim ? `Structural similarity (SSIM ${item.metrics.ssim}) measured at thumbnail scale` : undefined}>{formatSimilarity(item.metrics?.ssim)}</span>
+                              <Download aria-hidden="true" size={17} />
                             </a>
                           ))}
                         </div>

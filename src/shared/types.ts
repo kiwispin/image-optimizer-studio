@@ -74,6 +74,8 @@ export interface JobResult {
   };
   status: "done" | "error";
   error?: string;
+  /** Non-fatal messages, e.g. a format that was skipped. */
+  notes?: string[];
   variants: OutputVariant[];
 }
 

@@ -211,3 +211,60 @@ describe("processor", () => {
     expect(job.variants[0].filename).toContain(".jxl");
   });
 });
+
+describe("large image handling", () => {
+  it("searches on a proxy but writes a full-size output", async () => {
+    const width = 1600;
+    const height = 1000;
+    const raw = Buffer.alloc(width * height * 3);
+    for (let index = 0; index < raw.length; index += 3) {
+      const pixel = index / 3;
+      raw[index] = (pixel % width) % 255;
+      raw[index + 1] = Math.floor(pixel / width) % 255;
+      raw[index + 2] = (pixel * 7) % 255;
+    }
+    const buffer = await sharp(raw, { raw: { width, height, channels: 3 } }).blur(1).jpeg({ quality: 92 }).toBuffer();
+    const job = await processUpload(buffer, "large.jpg", { preset: "balanced", formats: ["auto", "webp"] });
+
+    expect(job.status).toBe("done");
+    expect(job.variants).toHaveLength(2);
+    for (const variant of job.variants) {
+      expect(variant.width).toBe(width);
+      expect(variant.height).toBe(height);
+      expect(variant.size).toBeLessThan(buffer.byteLength);
+    }
+  }, 60000);
+});
+
+describe("store cleanup", () => {
+  it("removes stored files older than the retention window", async () => {
+    const { sweepStore, saveOutput } = await import("../src/server/store.js");
+    const { utimes } = await import("node:fs/promises");
+    const target = await saveOutput("sweeptest0001", "old.png", Buffer.from("x"));
+    const old = new Date(Date.now() - 3 * 60 * 60 * 1000);
+    await utimes(target, old, old);
+
+    const removed = await sweepStore(60 * 60 * 1000);
+    expect(removed).toContain(target);
+  });
+});
+
+describe("auto format safety", () => {
+  it("lets a JPEG input compete as JPEG instead of ballooning into lossless PNG", async () => {
+    const width = 640;
+    const height = 420;
+    const raw = Buffer.alloc(width * height * 3);
+    for (let index = 0; index < raw.length; index += 3) {
+      const value = (index * 37 + Math.floor(index / 11) * 17) % 255;
+      raw[index] = value;
+      raw[index + 1] = (value * 3) % 255;
+      raw[index + 2] = (value * 7) % 255;
+    }
+    const buffer = await sharp(raw, { raw: { width, height, channels: 3 } }).blur(1.2).jpeg({ quality: 92 }).toBuffer();
+    const job = await processUpload(buffer, "noisy.jpg", { preset: "balanced", formats: ["auto"] });
+
+    expect(job.status).toBe("done");
+    expect(job.variants[0].metrics?.autoCandidateFormats).toContain("jpeg");
+    expect(job.variants[0].size).toBeLessThan(buffer.byteLength);
+  }, 60000);
+});
