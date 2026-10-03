@@ -498,38 +498,70 @@ async function encodeFromProxy(
     : encode(sharp(proxy, { failOn: "none" }), format, options, quality, contentClass, "search").toBuffer();
 }
 
-async function classifyContent(sample: RawImage | undefined, metadata: sharp.Metadata): Promise<ContentClass> {
-  if ((metadata.pages || 1) > 1) return "animation";
-  if (!sample) return "photo";
-
+/**
+ * Classify content from a nearest-neighbour sample (no resampling blur, so a graphic keeps its
+ * exact palette and a photo keeps its sensor/JPEG noise).
+ *
+ * Signals:
+ * - flatRatio: share of horizontally adjacent pixels that are exactly identical. UI screenshots and
+ *   flat graphics are mostly flat (>0.4); real photos almost never are (<0.15 on typical camera shots).
+ * - colorRatio: exact distinct colours per sampled pixel. Graphics use a handful; photos tens of thousands.
+ *
+ * The previous classifier used 4-bit colour buckets on a blurred 96px sample, which put 27 of 28 real
+ * camera photos in a test set into "screenshot"/"graphic" (slow PNG/near-lossless candidates, 4:4:4 JPEG).
+ */
+async function sampleForClassification(original: Buffer): Promise<RawImage | undefined> {
   try {
-    const buckets = new Set<string>();
-    let totalDelta = 0;
-    let checks = 0;
-    for (let y = 1; y < sample.height; y += 1) {
-      for (let x = 1; x < sample.width; x += 1) {
-        const pixel = y * sample.width + x;
-        const left = pixel - 1;
-        const up = pixel - sample.width;
-        totalDelta += Math.abs(luminance(sample, pixel) - luminance(sample, left));
-        totalDelta += Math.abs(luminance(sample, pixel) - luminance(sample, up));
-        checks += 2;
-        const offset = pixel * sample.channels;
-        buckets.add(`${sample.data[offset] >> 4}-${sample.data[offset + 1] >> 4}-${sample.data[offset + 2] >> 4}`);
+    const raw = await inputImage(original)
+      .removeAlpha()
+      .resize({ width: 256, height: 256, fit: "inside", kernel: "nearest", withoutEnlargement: true })
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    return { data: raw.data, width: raw.info.width, height: raw.info.height, channels: raw.info.channels };
+  } catch {
+    return undefined;
+  }
+}
+
+export function classifyFromSample(sample: RawImage, hasAlpha?: boolean): ContentClass {
+  const { data, width, height, channels } = sample;
+  const pixels = width * height;
+  if (!pixels) return "photo";
+
+  const colors = new Set<number>();
+  let flat = 0;
+  let pairs = 0;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const offset = (y * width + x) * channels;
+      colors.add((data[offset] << 16) | (data[offset + 1] << 8) | data[offset + 2]);
+      if (x > 0) {
+        const left = offset - channels;
+        pairs += 1;
+        if (data[offset] === data[left] && data[offset + 1] === data[left + 1] && data[offset + 2] === data[left + 2]) {
+          flat += 1;
+        }
       }
     }
-    const uniqueRatio = buckets.size / Math.max(1, sample.width * sample.height);
-    const edgeDelta = totalDelta / Math.max(1, checks);
-    if (metadata.hasAlpha) {
-      return uniqueRatio < 0.08 ? "transparent-graphic" : "transparent-photo";
-    }
-    if (uniqueRatio < 0.045) return "graphic";
-    if (uniqueRatio < 0.16 && edgeDelta > 12) return "screenshot";
-  } catch {
-    return "photo";
   }
 
+  const flatRatio = flat / Math.max(1, pairs);
+  const colorRatio = colors.size / pixels;
+  const isGraphic = colors.size <= 256 || (flatRatio > 0.6 && colorRatio < 0.05);
+  const isScreenshot = !isGraphic && flatRatio > 0.35;
+
+  if (hasAlpha) {
+    return isGraphic || isScreenshot ? "transparent-graphic" : "transparent-photo";
+  }
+  if (isGraphic) return "graphic";
+  if (isScreenshot) return "screenshot";
   return "photo";
+}
+
+async function classifyContent(original: Buffer, metadata: sharp.Metadata): Promise<ContentClass> {
+  if ((metadata.pages || 1) > 1) return "animation";
+  const sample = await sampleForClassification(original);
+  return sample ? classifyFromSample(sample, metadata.hasAlpha) : "photo";
 }
 
 function maxColorDeltaFor(contentClass: ContentClass, options: ProcessOptions): number {
@@ -726,7 +758,7 @@ export async function processStoredImage(stored: StoredImage, original: Buffer, 
     const allowAvif = outputPixels <= maxAvifPixels;
     const notes: string[] = [];
     const reference = await buildReference(original);
-    const contentClass = await classifyContent(reference?.psnr, metadata);
+    const contentClass = await classifyContent(original, metadata);
     const originalFormat = normalizeSharpFormat(metadata.format);
     const requestedFormats = options.formats.map((format) => (format === "original" ? originalFormat : format));
     const uniqueFormats = [...new Set(requestedFormats)];

@@ -268,3 +268,36 @@ describe("auto format safety", () => {
     expect(job.variants[0].size).toBeLessThan(buffer.byteLength);
   }, 60000);
 });
+
+describe("content classification", () => {
+  it("treats noisy camera-like images as photos and flat UI as screenshots", async () => {
+    const { classifyFromSample } = await import("../src/server/processor.js");
+    const width = 200;
+    const height = 150;
+    const photo = Buffer.alloc(width * height * 3);
+    const screenshot = Buffer.alloc(width * height * 3, 246);
+    let seed = 7;
+    const noise = () => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed % 9;
+    };
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const offset = (y * width + x) * 3;
+        // Smooth, low-colour scene (like foliage or sky) plus sensor noise.
+        photo[offset] = 60 + Math.round(x / 8) + noise();
+        photo[offset + 1] = 110 + Math.round(y / 10) + noise();
+        photo[offset + 2] = 70 + noise();
+        // Flat UI with a few coloured bars and anti-aliased-ish text rows.
+        if (y % 20 < 4 && x > 20 && x < 180) {
+          screenshot[offset] = 33 + (x % 3) * 40;
+          screenshot[offset + 1] = 122;
+          screenshot[offset + 2] = 94 + (y % 4) * 20;
+        }
+      }
+    }
+
+    expect(classifyFromSample({ data: photo, width, height, channels: 3 })).toBe("photo");
+    expect(classifyFromSample({ data: screenshot, width, height, channels: 3 })).not.toBe("photo");
+  });
+});

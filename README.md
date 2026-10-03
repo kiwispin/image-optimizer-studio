@@ -24,6 +24,20 @@ A free local and self-hostable TinyPNG-style image optimizer. In local mode it r
 
 ## Run
 
+### macOS
+
+1. Install **Node.js 20 or newer** (the LTS installer from [nodejs.org](https://nodejs.org) is easiest; Homebrew or nvm also work).
+2. Get the code: `git clone https://github.com/kiwispin/image-optimizer-studio.git` (or GitHub Desktop, or **Code → Download ZIP** and unzip it).
+3. In Finder, double-click **`Start Image Optimizer Studio.command`**.
+
+The first run installs dependencies and builds the app (about a minute), then opens `http://127.0.0.1:4174` in your browser. Leave the Terminal window open while you use the app; close it to stop the server. Later runs start in a few seconds, and the launcher rebuilds automatically after you pull updates.
+
+If macOS says the file "can't be opened because it is from an unidentified developer" (this happens with the ZIP download), right-click it, choose **Open**, then **Open** again. If it says you don't have permission, run `chmod +x "Start Image Optimizer Studio.command" scripts/start-local.sh` once in Terminal from the project folder.
+
+From Terminal you can also run `./scripts/start-local.sh`.
+
+### Windows
+
 For normal local use on Windows, double-click:
 
 ```text
