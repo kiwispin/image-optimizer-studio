@@ -14,3 +14,13 @@ services:
         value: 0.0.0.0
       - key: PUBLIC_DEPLOYMENT
         value: true
+      # Reduces glibc memory fragmentation with sharp/libvips (recommended by sharp's docs).
+      - key: MALLOC_ARENA_MAX
+        value: 2
+      # Optional overrides (defaults shown for hosted mode):
+      # - key: MAX_UPLOAD_MB
+      #   value: 50
+      # - key: RETENTION_HOURS
+      #   value: 1
+      # - key: PROCESS_CONCURRENCY
+      #   value: 1
